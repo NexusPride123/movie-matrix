@@ -1,0 +1,756 @@
+
+
+"use server";
+
+import { getRecommendations } from "@/ai/flows/ai-recommendations";
+import { z } from "zod";
+import type { RecommendationsOutput } from "@/ai/flows/ai-recommendations";
+import type { User, Booking, Review, Movie, Event } from "@/lib/data";
+import { users as mockUsers, bookings as mockBookings, reviews as mockReviews, messages as mockMessages, movies as mockMovies, events as mockEvents } from "@/lib/data";
+import db from '@/lib/db';
+import { revalidatePath } from 'next/cache';
+import { cookies } from 'next/headers';
+import { redirect } from "next/navigation";
+
+
+const recommendSchema = z.object({
+  interests: z.string().min(10, { message: "Please tell us a bit more about what you like." }),
+});
+
+type AIState = {
+  message: "success" | "error" | "";
+  data: RecommendationsOutput | null;
+  errors: { interests?: string[] } | null;
+}
+
+export async function getAIRecommendations(prevState: AIState, formData: FormData): Promise<AIState> {
+  const validatedFields = recommendSchema.safeParse({
+    interests: formData.get("interests"),
+  });
+
+  if (!validatedFields.success) {
+    return {
+      message: "error",
+      errors: validatedFields.error.flatten().fieldErrors,
+      data: null,
+    };
+  }
+
+  try {
+    const recommendations = await getRecommendations({
+      userViewingHistory: "The Matrix, Inception, John Wick, Interstellar",
+      trendingShows: "Dune: Part Two, The Bear, Fallout (TV series), Shogun",
+      interests: validatedFields.data.interests,
+    });
+    return {
+      message: "success",
+      data: recommendations,
+      errors: null,
+    };
+  } catch (error) {
+    console.error(error);
+    return {
+      message: "error",
+      errors: null,
+      data: null
+    };
+  }
+}
+
+
+const reviewSchema = z.object({
+  rating: z.coerce.number().min(1, "Please provide a rating."),
+  comment: z.string().min(10, "Comment must be at least 10 characters."),
+  itemId: z.string(),
+  itemType: z.enum(["movie", "event"]),
+  userId: z.string(),
+  userName: z.string(),
+  userAvatar: z.string(),
+});
+
+type ReviewState = {
+    message: "success" | "error" | "";
+    errors: { rating?: string[], comment?: string[], _form?: string[] } | null;
+    newReview?: Review | null;
+}
+
+export async function submitReview(prevState: ReviewState, formData: FormData): Promise<ReviewState> {
+  const validatedFields = reviewSchema.safeParse({
+    rating: formData.get("rating"),
+    comment: formData.get("comment"),
+    itemId: formData.get("itemId"),
+    itemType: formData.get("itemType"),
+    userId: formData.get("userId"),
+    userName: formData.get("userName"),
+    userAvatar: formData.get("userAvatar"),
+  });
+
+  if (!validatedFields.success) {
+    return {
+      message: "error",
+      errors: validatedFields.error.flatten().fieldErrors,
+    };
+  }
+
+  const { rating, comment, itemId, itemType, userId, userName, userAvatar } = validatedFields.data;
+  const newReviewData = {
+    user: userName,
+    avatar: userAvatar,
+    rating,
+    comment,
+  };
+  
+  try {
+    await db.query(
+        'INSERT INTO reviews (itemId, itemType, userId, rating, comment, createdAt) VALUES (?, ?, ?, ?, ?, ?)',
+        [itemId, itemType, userId, rating, comment, new Date()]
+    );
+
+    revalidatePath(`/${itemType}s/${itemId}`);
+    return { message: "success", errors: null, newReview: newReviewData };
+
+  } catch (error) {
+    console.warn("Error submitting review to DB, falling back to mock data.", error);
+    
+    // Fallback: Add to mock reviews
+    const targetItem = itemType === 'movie' 
+      ? mockMovies.find((m: any) => m.id === itemId)
+      : mockEvents.find((e: any) => e.id === itemId);
+
+    if (targetItem) {
+        if (!targetItem.reviews) {
+            targetItem.reviews = [];
+        }
+        targetItem.reviews.unshift(newReviewData);
+        revalidatePath(`/${itemType}s/${itemId}`);
+        return { message: "success", errors: null, newReview: newReviewData };
+    }
+    
+    return { 
+        message: "error", 
+        errors: { _form: ["Something went wrong submitting your review."] },
+    };
+  }
+}
+
+// Admin Movie Actions
+const castSchema = z.object({
+  name: z.string().min(1, "Cast name is required."),
+  character: z.string().min(1, "Character name is required."),
+  imageUrl: z.string().url("Please enter a valid image URL."),
+});
+
+const movieSchema = z.object({
+  title: z.string().min(1, "Title is required."),
+  tagline: z.string().optional(),
+  posterUrl: z.string().url("Please enter a valid URL for the poster."),
+  backdropUrl: z.string().url("Please enter a valid URL for the backdrop."),
+  genres: z.string().min(1, "Please enter at least one genre."),
+  languages: z.string().min(1, "Please enter at least one language."),
+  rating: z.coerce.number().min(0).max(10),
+  releaseDate: z.string().min(1, "Release date is required."),
+  overview: z.string().min(10, "Overview should be at least 10 characters."),
+  trailerUrl: z.string().url("Please enter a valid YouTube embed URL."),
+  cities: z.string().min(1, "Please enter at least one city."),
+  cast: z.array(castSchema),
+});
+
+
+export async function addMovie(values: z.infer<typeof movieSchema>) {
+  const validatedFields = movieSchema.safeParse(values);
+
+  if (!validatedFields.success) {
+    return { success: false, message: 'Invalid data.' };
+  }
+
+  const { cast, ...movieData } = validatedFields.data;
+  const movieId = `movie-${Date.now()}`;
+  
+  try {
+    const connection = await db.getConnection();
+    await connection.beginTransaction();
+    await connection.query('INSERT INTO movies (id, title, tagline, posterUrl, backdropUrl, rating, releaseDate, overview, trailerUrl) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', [
+        movieId, movieData.title, movieData.tagline, movieData.posterUrl, movieData.backdropUrl, movieData.rating, movieData.releaseDate, movieData.overview, movieData.trailerUrl
+    ]);
+
+    if (cast.length > 0) {
+        const castValues = cast.map(c => [movieId, c.name, c.character, c.imageUrl]);
+        await connection.query('INSERT INTO cast_members (movieId, name, character, imageUrl) VALUES ?', [castValues]);
+    }
+    
+    await connection.commit();
+    connection.release();
+    revalidatePath('/admin/movies');
+    revalidatePath('/movies');
+    return { success: true, message: 'Movie added successfully.' };
+  } catch (error) {
+    console.warn("Database not connected. Falling back to mock data for addMovie.");
+    const newMovie: Movie = {
+      id: movieId,
+      ...movieData,
+      genres: movieData.genres.split(',').map(s => s.trim()),
+      languages: movieData.languages.split(',').map(s => s.trim()),
+      cities: movieData.cities.split(',').map(s => s.trim()),
+      cast: cast,
+      reviews: []
+    };
+    mockMovies.unshift(newMovie);
+    revalidatePath('/admin/movies');
+    revalidatePath('/movies');
+    return { success: true, message: 'Movie added successfully (mock).' };
+  }
+}
+
+export async function updateMovie(id: string, values: z.infer<typeof movieSchema>) {
+    const validatedFields = movieSchema.safeParse(values);
+
+    if (!validatedFields.success) {
+        return { success: false, message: 'Invalid data.' };
+    }
+
+    const { cast, ...movieData } = validatedFields.data;
+
+    try {
+        const connection = await db.getConnection();
+        await connection.beginTransaction();
+
+        await connection.query('UPDATE movies SET title = ?, tagline = ?, posterUrl = ?, backdropUrl = ?, rating = ?, releaseDate = ?, overview = ?, trailerUrl = ? WHERE id = ?', [
+            movieData.title, movieData.tagline, movieData.posterUrl, movieData.backdropUrl, movieData.rating, movieData.releaseDate, movieData.overview, movieData.trailerUrl, id
+        ]);
+
+        await connection.query('DELETE FROM cast_members WHERE movieId = ?', [id]);
+        if (cast.length > 0) {
+            const castValues = cast.map(c => [id, c.name, c.character, c.imageUrl]);
+            await connection.query('INSERT INTO cast_members (movieId, name, character, imageUrl) VALUES ?', [castValues]);
+        }
+
+        await connection.commit();
+        connection.release();
+        revalidatePath('/admin/movies');
+        revalidatePath(`/movies/${id}`);
+        return { success: true, message: 'Movie updated successfully.' };
+    } catch (error) {
+        console.warn("Database not connected. Falling back to mock data for updateMovie.");
+        const movieIndex = mockMovies.findIndex(m => m.id === id);
+        if (movieIndex !== -1) {
+            const updatedMovie = {
+                ...mockMovies[movieIndex],
+                ...movieData,
+                 genres: movieData.genres.split(',').map(s => s.trim()),
+                languages: movieData.languages.split(',').map(s => s.trim()),
+                cities: movieData.cities.split(',').map(s => s.trim()),
+                cast: cast
+            };
+            mockMovies[movieIndex] = updatedMovie;
+            revalidatePath('/admin/movies');
+            revalidatePath(`/movies/${id}`);
+            return { success: true, message: 'Movie updated successfully (mock).' };
+        }
+        return { success: false, message: 'Movie not found in mock data.' };
+    }
+}
+
+export async function deleteMovie(id: string) {
+    try {
+        await db.query('DELETE FROM movies WHERE id = ?', [id]);
+        revalidatePath('/admin/movies');
+        revalidatePath('/movies');
+        return { success: true, message: 'Movie deleted successfully.' };
+    } catch (error) {
+        console.warn("Database not connected. Falling back to mock data for deleteMovie.");
+        const movieIndex = mockMovies.findIndex(m => m.id === id);
+        if (movieIndex !== -1) {
+            mockMovies.splice(movieIndex, 1);
+            revalidatePath('/admin/movies');
+            revalidatePath('/movies');
+            return { success: true, message: 'Movie deleted successfully (mock).' };
+        }
+        return { success: false, message: 'Movie not found in mock data.' };
+    }
+}
+
+// Admin Event Actions
+const eventSchema = z.object({
+  id: z.string().optional(),
+  title: z.string().min(1, "Title is required."),
+  type: z.string().min(1, "Type is required."),
+  imageUrl: z.string().url("Please enter a valid image URL."),
+  date: z.string().min(1, "Date is required."),
+  location: z.string().min(1, "Location is required."),
+  description: z.string().min(10, "Description should be at least 10 characters."),
+});
+
+export async function addEvent(values: z.infer<typeof eventSchema>) {
+  const validatedFields = eventSchema.safeParse(values);
+
+  if (!validatedFields.success) {
+    return { success: false, message: 'Invalid data.' };
+  }
+  
+  const eventId = `event-${Date.now()}`;
+  try {
+    await db.query('INSERT INTO events (id, title, type, imageUrl, date, location, description) VALUES (?, ?, ?, ?, ?, ?, ?)',
+     [eventId, values.title, values.type, values.imageUrl, values.date, values.location, values.description]
+    );
+    revalidatePath('/admin/events');
+    revalidatePath('/events');
+    return { success: true, message: 'Event added successfully.' };
+  } catch (error) {
+    console.warn("Database not connected. Falling back to mock data for addEvent.");
+    const newEvent: Event = {
+        id: eventId,
+        ...validatedFields.data,
+        reviews: []
+    };
+    mockEvents.unshift(newEvent);
+    revalidatePath('/admin/events');
+    revalidatePath('/events');
+    return { success: true, message: 'Event added successfully (mock).' };
+  }
+}
+
+export async function updateEvent(id: string, values: z.infer<typeof eventSchema>) {
+    const validatedFields = eventSchema.safeParse(values);
+
+    if (!validatedFields.success) {
+        return { success: false, message: 'Invalid data.' };
+    }
+    
+    try {
+        await db.query('UPDATE events SET title = ?, type = ?, imageUrl = ?, date = ?, location = ?, description = ? WHERE id = ?',
+         [values.title, values.type, values.imageUrl, values.date, values.location, values.description, id]
+        );
+        revalidatePath('/admin/events');
+        revalidatePath(`/events/${id}`);
+        return { success: true, message: 'Event updated successfully.' };
+    } catch (error) {
+        console.warn("Database not connected. Falling back to mock data for updateEvent.");
+        const eventIndex = mockEvents.findIndex(e => e.id === id);
+        if (eventIndex !== -1) {
+            mockEvents[eventIndex] = { ...mockEvents[eventIndex], ...validatedFields.data };
+            revalidatePath('/admin/events');
+            revalidatePath(`/events/${id}`);
+            return { success: true, message: 'Event updated successfully (mock).' };
+        }
+        return { success: false, message: 'Event not found in mock data.' };
+    }
+}
+
+export async function deleteEvent(id: string) {
+    try {
+        await db.query('DELETE FROM events WHERE id = ?', [id]);
+        revalidatePath('/admin/events');
+        revalidatePath('/events');
+        return { success: true, message: 'Event deleted successfully.' };
+    } catch (error) {
+        console.warn("Database not connected. Falling back to mock data for deleteEvent.");
+        const eventIndex = mockEvents.findIndex(e => e.id === id);
+        if (eventIndex !== -1) {
+            mockEvents.splice(eventIndex, 1);
+            revalidatePath('/admin/events');
+            revalidatePath('/events');
+            return { success: true, message: 'Event deleted successfully (mock).' };
+        }
+        return { success: false, message: 'Event not found in mock data.' };
+    }
+}
+
+// Admin User Actions
+export async function deleteUser(id: string) {
+    try {
+        await db.query('DELETE FROM users WHERE id = ?', [id]);
+        revalidatePath('/admin/users');
+        return { success: true, message: 'User deleted successfully.' };
+    } catch (error) {
+        console.warn("Database not connected. Falling back to mock data for deleteUser.");
+        const userIndex = mockUsers.findIndex(u => u.id === id);
+        if (userIndex !== -1) {
+            mockUsers.splice(userIndex, 1);
+            revalidatePath('/admin/users');
+            return { success: true, message: 'User deleted successfully (mock).' };
+        }
+        return { success: false, message: 'User not found in mock data.' };
+    }
+}
+
+// Admin Message Actions
+export async function deleteMessage(id: string) {
+    try {
+        await db.query('DELETE FROM messages WHERE id = ?', [id]);
+        revalidatePath('/admin/messages');
+        return { success: true, message: 'Message deleted successfully.' };
+    } catch (error) {
+        console.warn("Database not connected. Falling back to mock data for deleteMessage.");
+        const messageIndex = mockMessages.findIndex(m => m.id === id);
+        if (messageIndex !== -1) {
+            mockMessages.splice(messageIndex, 1);
+            revalidatePath('/admin/messages');
+            return { success: true, message: 'Message deleted successfully (mock).' };
+        }
+        return { success: false, message: 'Message not found in mock data.' };
+    }
+}
+
+// Profile Actions
+const profileSchema = z.object({
+  userId: z.string(),
+  name: z.string().min(2, "Name must be at least 2 characters."),
+  avatar: z.string().url().optional().or(z.literal('')),
+  currentPassword: z.string().optional(),
+  newPassword: z.string().optional(),
+}).refine(data => {
+    if (data.newPassword && !data.currentPassword) {
+        return false;
+    }
+    return true;
+}, {
+    message: "Current password is required to set a new password.",
+    path: ["currentPassword"],
+});
+
+
+type ProfileState = {
+  message: "success" | "error" | "";
+  errors: { name?: string[], currentPassword?: string[], newPassword?: string[], _form?: string[] } | null;
+  updatedUser: Partial<User> | null;
+}
+
+export async function updateProfile(
+    userCurrentPassword_DoNotUse: string | undefined,
+    prevState: ProfileState, 
+    formData: FormData
+): Promise<ProfileState> {
+    
+    const rawData = {
+        userId: formData.get("userId"),
+        name: formData.get("name"),
+        avatar: formData.get("avatar"),
+        currentPassword: formData.get("currentPassword"),
+        newPassword: formData.get("newPassword"),
+    };
+    
+    const validatedFields = profileSchema.safeParse(rawData);
+
+    if (!validatedFields.success) {
+        return {
+            ...prevState,
+            message: "error",
+            errors: validatedFields.error.flatten().fieldErrors,
+            updatedUser: null,
+        };
+    }
+
+    const { userId, name, currentPassword, newPassword, avatar } = validatedFields.data;
+
+    const dataToUpdate: { name: string; avatar?: string; password?: string } = { name };
+    if (avatar) dataToUpdate.avatar = avatar;
+
+    if (newPassword) {
+        if (!currentPassword) {
+             return {
+                ...prevState,
+                message: "error",
+                errors: { currentPassword: ["Current password is required to set a new password."] },
+                updatedUser: null,
+            }
+        }
+        if (newPassword.length < 6) {
+             return {
+                ...prevState,
+                message: "error",
+                errors: { newPassword: ["New password must be at least 6 characters."] },
+                updatedUser: null,
+            }
+        }
+        if (currentPassword !== userCurrentPassword_DoNotUse) {
+            return {
+                ...prevState,
+                message: "error",
+                errors: { currentPassword: ["Incorrect current password."] },
+                updatedUser: null,
+            }
+        }
+        dataToUpdate.password = newPassword;
+    }
+    
+    try {
+        if (dataToUpdate.password) {
+            await db.query('UPDATE users SET name = ?, avatar = ?, password = ? WHERE id = ?', 
+                [dataToUpdate.name, dataToUpdate.avatar || null, dataToUpdate.password, userId]
+            );
+        } else {
+             await db.query('UPDATE users SET name = ?, avatar = ? WHERE id = ?', 
+                [dataToUpdate.name, dataToUpdate.avatar || null, userId]
+            );
+        }
+
+        revalidatePath('/profile');
+        revalidatePath('/admin/users');
+        
+        const [rows] = await db.query('SELECT * FROM users WHERE id = ?', [userId]);
+        const updatedUserFromDb = (rows as User[])[0];
+
+        return { 
+            message: "success", 
+            errors: null, 
+            updatedUser: updatedUserFromDb,
+        };
+    } catch (error) {
+        console.warn("Error updating profile in DB, falling back to mock data.", error);
+        const userIndex = mockUsers.findIndex(u => u.id === userId);
+        if (userIndex > -1) {
+            mockUsers[userIndex] = { ...mockUsers[userIndex], ...dataToUpdate };
+            revalidatePath('/profile');
+            revalidatePath('/admin/users');
+             return { 
+                message: "success", 
+                errors: null, 
+                updatedUser: mockUsers[userIndex],
+            };
+        }
+
+        return { 
+            ...prevState,
+            message: "error", 
+            errors: { _form: ["Something went wrong."] },
+            updatedUser: null,
+        };
+    }
+}
+
+export async function deleteAccount(userId: string, role: string) {
+    if (role === 'Admin') {
+        return { success: false, message: 'Admin accounts cannot be deleted.' };
+    }
+    try {
+        await db.query('DELETE FROM users WHERE id = ?', [userId]);
+        cookies().delete('user_id');
+        revalidatePath('/admin/users');
+        revalidatePath('/');
+        return { success: true, message: 'Account deleted successfully.' };
+    } catch (error) {
+        console.error(`Deleting account ${userId} failed:`, error);
+        return { success: false, message: 'Database error.' };
+    }
+}
+
+
+// Contact Page Action
+const messageSchema = z.object({
+  name: z.string().min(2, "Name must be at least 2 characters."),
+  email: z.string().email("Please enter a valid email."),
+  subject: z.string().min(5, "Subject must be at least 5 characters."),
+  message: z.string().min(10, "Message must be at least 10 characters."),
+});
+
+type MessageState = {
+    message: "success" | "error" | "";
+    errors: { name?: string[], email?: string[], subject?: string[], message?: string[], _form?: string[] } | null;
+    validatedData?: z.infer<typeof messageSchema>;
+}
+
+export async function submitMessage(prevState: MessageState, formData: FormData): Promise<MessageState> {
+    const validatedFields = messageSchema.safeParse(Object.fromEntries(formData.entries()));
+
+    if (!validatedFields.success) {
+        return {
+            message: "error",
+            errors: validatedFields.error.flatten().fieldErrors,
+        };
+    }
+    
+    const { name, email, subject, message } = validatedFields.data;
+    const messageId = `msg-${Date.now()}`;
+    try {
+        await db.query('INSERT INTO messages (id, name, email, subject, message, isRead) VALUES (?, ?, ?, ?, ?, ?)', 
+            [messageId, name, email, subject, message, false]
+        );
+
+        revalidatePath('/admin/messages');
+        
+        return { 
+            message: "success", 
+            errors: null,
+            validatedData: validatedFields.data,
+        };
+    } catch (error) {
+        console.warn("Error submitting message to DB, falling back to mock data.", error);
+        // Fallback: Add to mock messages
+        const newMessage = {
+          id: messageId,
+          name,
+          email,
+          subject,
+          message,
+          receivedAt: new Date().toISOString(),
+          isRead: false,
+        };
+        mockMessages.unshift(newMessage);
+        revalidatePath('/admin/messages');
+        return { 
+            message: "success", 
+            errors: null, 
+            validatedData: validatedFields.data,
+        };
+    }
+}
+
+// Auth Actions
+const loginSchema = z.object({
+  email: z.string().email("Please enter a valid email address."),
+  password: z.string().min(6, "Password must be at least 6 characters."),
+});
+
+export async function login(values: z.infer<typeof loginSchema>) {
+    const validatedFields = loginSchema.safeParse(values);
+    if (!validatedFields.success) {
+        return { success: false, message: "Invalid email or password." };
+    }
+    
+    const { email, password } = validatedFields.data;
+
+    try {
+        const [rows] = await db.query('SELECT * FROM users WHERE email = ? AND password = ?', [email, password]);
+        const users = rows as User[];
+        const user = users[0];
+
+        if (!user) {
+            return { success: false, message: 'Invalid email or password.' };
+        }
+        
+        cookies().set('user_id', user.id, { httpOnly: true, path: '/' });
+
+        return { success: true, user };
+
+    } catch (error) {
+        console.warn("Login database error, falling back to mock data.", error);
+        // Fallback to mock data if database connection fails
+        const user = mockUsers.find(u => u.email === email && u.password === password);
+
+        if (!user) {
+            return { success: false, message: 'Invalid email or password.' };
+        }
+
+        cookies().set('user_id', user.id, { httpOnly: true, path: '/' });
+        return { success: true, user };
+    }
+}
+
+
+export async function logout() {
+    cookies().delete('user_id');
+}
+
+
+const signupSchema = z.object({
+  name: z.string().min(2, "Name must be at least 2 characters."),
+  email: z.string().email("Please enter a valid email address."),
+  password: z.string().min(6, "Password must be at least 6 characters."),
+});
+
+export async function signup(values: z.infer<typeof signupSchema>) {
+    const validatedFields = signupSchema.safeParse(values);
+
+    if (!validatedFields.success) {
+        return { success: false, message: "Invalid data provided." };
+    }
+    
+    const { name, email, password } = validatedFields.data;
+    const userId = `user-${Date.now()}`;
+    const newUser: User = {
+        id: userId,
+        name,
+        email,
+        password, // In a real app, hash this
+        role: 'User',
+        joined: new Date().toISOString(),
+        avatar: `https://i.pravatar.cc/150?u=${userId}`
+    };
+
+    try {
+        // Check if user already exists
+        const [existingUsers] = await db.query('SELECT id FROM users WHERE email = ?', [email]);
+        if ((existingUsers as any[]).length > 0) {
+            return { success: false, message: "An account with this email already exists." };
+        }
+        
+        await db.query('INSERT INTO users (id, name, email, password, role, avatar, joined) VALUES (?, ?, ?, ?, ?, ?, ?)', [
+            newUser.id, newUser.name, newUser.email, newUser.password, newUser.role, newUser.avatar, new Date(newUser.joined)
+        ]);
+        
+        cookies().set('user_id', userId, { httpOnly: true, path: '/' });
+
+        return { success: true, user: newUser };
+    } catch (error) {
+        console.warn("Signup database error, falling back to mock data.", error);
+        // Fallback to mock data if database connection fails
+        if (mockUsers.find(u => u.email === email)) {
+            return { success: false, message: "An account with this email already exists." };
+        }
+        mockUsers.push(newUser);
+        
+        cookies().set('user_id', userId, { httpOnly: true, path: '/' });
+        return { success: true, user: newUser };
+    }
+}
+
+const bookingSchema = z.object({
+    itemId: z.string(),
+    itemType: z.enum(['movie', 'event']),
+    showDate: z.string(),
+    showTime: z.string(),
+    seats: z.array(z.string()),
+    total: z.number(),
+    theater: z.string().optional(),
+    userId: z.string()
+});
+
+export async function createBooking(values: z.infer<typeof bookingSchema>) {
+    const validatedFields = bookingSchema.safeParse(values);
+
+    if (!validatedFields.success) {
+        return { success: false, message: 'Invalid booking data.' };
+    }
+    
+    const { itemId, itemType, showDate, showTime, seats, total, theater, userId } = validatedFields.data;
+    const bookingId = `booking-${Date.now()}`;
+    const newBooking: Booking = {
+        id: bookingId,
+        userId,
+        itemId,
+        itemType,
+        bookingDate: new Date().toISOString(),
+        showDate,
+        showTime,
+        theater,
+        seats,
+        total,
+        status: 'confirmed'
+    };
+
+    try {
+        await db.query('INSERT INTO bookings (id, userId, itemId, itemType, bookingDate, showDate, showTime, theater, seats, total, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [
+            newBooking.id,
+            newBooking.userId,
+            newBooking.itemId,
+            newBooking.itemType,
+            new Date(newBooking.bookingDate),
+            newBooking.showDate,
+            newBooking.showTime,
+            newBooking.theater,
+            JSON.stringify(newBooking.seats),
+            newBooking.total,
+            newBooking.status
+        ]);
+        revalidatePath('/bookings');
+        return { success: true, message: 'Booking successful!' };
+    } catch (error) {
+        console.warn("Error creating booking in DB, falling back to mock data.", error);
+        mockBookings.unshift(newBooking);
+        revalidatePath('/bookings');
+        return { success: true, message: 'Booking successful (mock)!' };
+    }
+}
+
+
+    
